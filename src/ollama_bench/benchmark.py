@@ -30,6 +30,13 @@ except Exception as e:
         f"Original error: {e}"
     )
 
+# List of allowed models
+ALLOWED_MODELS = [
+    "deepseek-coder-v2:16b",
+    "gemma4:26b",
+    "qwen3-coder:latest",
+    "qwen2.5-coder:14b"
+]
 
 IMPL_CANDIDATES = (
     "benchmark_impl.py",   # recommended
@@ -38,7 +45,6 @@ IMPL_CANDIDATES = (
     "bench_impl.py",
     "bench.py",
 )
-
 
 def _load_env() -> None:
     dotenv_path = find_dotenv(usecwd=True)
@@ -62,7 +68,6 @@ def _find_impl_path() -> Path:
         "`benchmark_impl.py` (recommended)."
     )
 
-
 def _import_impl_module(impl_path: Path):
     module_name = "ollama_bench_impl"
     spec = importlib.util.spec_from_file_location(module_name, str(impl_path))
@@ -72,13 +77,19 @@ def _import_impl_module(impl_path: Path):
     spec.loader.exec_module(mod)
     return mod
 
-
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     impl_path = _find_impl_path()
 
     if argv is None:
         argv = sys.argv[1:]
+
+    # Check for --model argument
+    model_arg = next((arg.split('=')[1] for arg in argv if arg.startswith('--model=')), None)
+    
+    if model_arg and model_arg not in ALLOWED_MODELS:
+        print(f"Error: Model '{model_arg}' is not allowed. Allowed models are: {', '.join(ALLOWED_MODELS)}")
+        return 1
 
     # Try import-and-call main() if present
     try:
@@ -102,7 +113,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     finally:
         sys.argv = old_argv
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

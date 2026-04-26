@@ -515,6 +515,22 @@ def run_app_smoke(project_dir: Path) -> dict:
     metrics_url = f"http://{host}:{port}/metrics"
     ingest_url = f"http://{host}:{port}/ingest"
 
+    gradlew_path = project_dir / "gradlew.bat" if os.name == "nt" else project_dir / "gradlew"
+    if not gradlew_path.exists():
+        return {
+            "cmd": str(gradlew),
+            "returncode": None,
+            "ok": False,
+            "started": False,
+            "health_ok": False,
+            "health_detail": "",
+            "metrics_ok": False,
+            "ingest_ok": False,
+            "stdout": f"gradlew executable not found at {gradlew_path}",
+            "stderr": "",
+            "stop_method": None,
+        }
+
     cmd = gradlew + [":app:run", "--no-daemon", "--console=plain"]
 
     env = os.environ.copy()
@@ -593,7 +609,7 @@ def run_app_smoke(project_dir: Path) -> dict:
         ok_i, code_i, body_i = _http_post_json(ingest_url, sample_event, timeout_sec=8)
         ingest_http = code_i
         ingest_ok = ok_i
-        ingest_detail = f"OK {code_i}" if ok_i else (f"HTTP {code_i}: {body_i[:200]}" if code_i is not None else body_i)
+        ingest_detail = f"OK {code_i}" if ok_i else (f"HTTP {code_i}: {body_m[:200]}" if code_i is not None else body_m)
 
         # Stop server
         stop_info = _terminate_process_tree(proc, grace_sec=10)
@@ -999,6 +1015,16 @@ def parse_pending_files(manifest_text: str) -> list[str]:
 # Phase 1 + Phase 2 orchestration
 # ============================================================
 
+
+# Function to sanitize the JSON string by removing invalid control characters
+def sanitize_json_string(json_str: str) -> str:
+    """
+    Removes invalid control characters from the JSON string.
+    """
+    # Remove non-printable ASCII characters (0-31 and 127)
+    sanitized = re.sub(r'[\x00-\x1f\x7f]', '', json_str)
+    return sanitized
+
 def phase1_scaffold(
     *,
     model: str,
@@ -1029,7 +1055,10 @@ def phase1_scaffold(
     phase1_raw_path.parent.mkdir(parents=True, exist_ok=True)
     phase1_raw_path.write_text(raw_text, encoding="utf-8")
 
-    obj = extract_json_object(raw_text)
+    # Sanitize the raw JSON response
+    sanitized_text = sanitize_json_string(raw_text)
+
+    obj = extract_json_object(sanitized_text)
     if not obj or "files" not in obj or "project" not in obj:
         raise RuntimeError(f"Phase 1 did not produce valid JSON with project/files for model {model}")
 
@@ -1044,12 +1073,25 @@ def phase1_scaffold(
 
     write_files_to_dir(project_dir, files)
 
-    # Save phase1 JSON for debugging
+    # Save sanitized phase1 JSON for debugging
     phase1_json_path = run_dir / "models" / safe_name(model) / f"phase1_{run_dir.name}.json"
     phase1_json_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
+    # Check if MANIFEST.md has PENDING_FILES section
+    manifest_path = project_dir / "MANIFEST.md"
+    if not manifest_path.exists():
+        raise RuntimeError("Phase 1 missing MANIFEST.md.")
+
+    pending_files = parse_pending_files(manifest_path.read_text(encoding="utf-8"))
+    if len(pending_files) < 20:
+        raise RuntimeError(f"MANIFEST.md has no PENDING_FILES list or fewer than 20 files. Found {len(pending_files)} files.")
+
     return obj, project_dir
 
+
+# phase2_generate_files.py
+
+import re
 
 def phase2_generate_files(
     *,
@@ -1106,7 +1148,10 @@ def phase2_generate_files(
             chunk_raw_path = model_run_dir / f"phase2_chunk_{stats['batches']+1}_{run_dir.name}.txt"
             chunk_raw_path.write_text(raw_text, encoding="utf-8")
 
-            obj = extract_json_object(raw_text)
+            # Sanitize the JSON response
+            sanitized_text = sanitize_json_string(raw_text)
+
+            obj = extract_json_object(sanitized_text)
             if not obj or "files" not in obj:
                 raise RuntimeError("Phase 2 chunk not valid JSON with files[]")
 
@@ -1247,6 +1292,7 @@ def run_model_end_to_end(
                 num_predict=phase0_num_predict,
                 max_hops=max_hops,
             )
+            result["phase0_response"] = full_arch  # Save raw response
         except Exception as e:
             _write_phase_error(run_dir, model, "PHASE0", e)
             result["error"] = f"Phase 0 (architecture) failed: {e}"
@@ -1268,6 +1314,8 @@ def run_model_end_to_end(
         )
 
         phase1_text = (phase1_resp.get("response") or "").strip()
+        result["phase1_response"] = phase1_text  # Save raw response
+
         phase1_obj = extract_json_object(phase1_text)
         if not phase1_obj or "files" not in phase1_obj or "project" not in phase1_obj:
             raise RuntimeError("Phase 1 did not produce valid JSON with project/files.")
@@ -1365,13 +1413,26 @@ def run_model_end_to_end(
 
 def write_run_artifacts(run_dir: Path, results: list[dict], env_info: dict):
     run_id = run_dir.name
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    results_json = run_dir / f"results_{run_id}.json"
-    results_csv = run_dir / f"results_{run_id}.csv"
-    report_md = run_dir / f"report_{run_id}.md"
-    env_json = run_dir / f"env_{run_id}.json"
+    # Construct file names with timestamp
+    results_json = run_dir / f"results_{run_id}_{timestamp}.json"
+    results_csv = run_dir / f"results_{run_id}_{timestamp}.csv"
+    report_md = run_dir / f"report_{run_id}_{timestamp}.md"
+    env_json = run_dir / f"env_{run_id}_{timestamp}.json"
 
+    # Save the raw JSON responses
+    for i, result in enumerate(results):
+        if "phase0_response" in result:
+            phase0_raw_path = run_dir / f"phase0_raw_{run_id}_{timestamp}_model{i}.txt"
+            phase0_raw_path.write_text(result["phase0_response"], encoding="utf-8")
+        
+        if "phase1_response" in result:
+            phase1_raw_path = run_dir / f"phase1_raw_{run_id}_{timestamp}_model{i}.txt"
+            phase1_raw_path.write_text(result["phase1_response"], encoding="utf-8")
+
+    # Write the results and environment info to respective files
     results_json.write_text(json.dumps(results, indent=2), encoding="utf-8")
     env_json.write_text(json.dumps(env_info, indent=2), encoding="utf-8")
 
