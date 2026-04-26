@@ -19,8 +19,6 @@ from __future__ import annotations
 import sys
 import runpy
 import importlib.util
-import subprocess
-import argparse
 from pathlib import Path
 
 try:
@@ -32,13 +30,6 @@ except Exception as e:
         f"Original error: {e}"
     )
 
-# List of allowed models
-ALLOWED_MODELS = [
-    "deepseek-coder-v2:16b",
-    "gemma4:26b",
-    "qwen3-coder:latest",
-    "qwen2.5-coder:14b"
-]
 
 IMPL_CANDIDATES = (
     "benchmark_impl.py",   # recommended
@@ -47,6 +38,7 @@ IMPL_CANDIDATES = (
     "bench_impl.py",
     "bench.py",
 )
+
 
 def _load_env() -> None:
     dotenv_path = find_dotenv(usecwd=True)
@@ -70,6 +62,7 @@ def _find_impl_path() -> Path:
         "`benchmark_impl.py` (recommended)."
     )
 
+
 def _import_impl_module(impl_path: Path):
     module_name = "ollama_bench_impl"
     spec = importlib.util.spec_from_file_location(module_name, str(impl_path))
@@ -80,25 +73,6 @@ def _import_impl_module(impl_path: Path):
     return mod
 
 
-def _get_ollama_models() -> list[str]:
-    try:
-        result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        lines = result.stdout.strip().split('\n')[1:]  # Skip header
-        models = []
-        for line in lines:
-            parts = line.split()
-            if parts:
-                models.append(parts[0])
-        return models
-    except Exception as e:
-        print(argparse.ArgumentTypeError(f"Failed to list Ollama models: {e}"))
-        return []
-
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     impl_path = _find_impl_path()
@@ -106,52 +80,29 @@ def main(argv: list[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
 
-    # Get all models currently in Ollama
-    installed_models = _get_ollama_models()
-    
-    # Intersection of installed models and allowed models
-    # We only want to run models that are BOTH installed and in our allowed list
-    models_to_run = [m for m in installed_models if m in ALLOWED_MODELS]
-
-    if not models_to_run:
-        print("No allowed models found installed in Ollama.")
-        return 0
-
-    # Prepare base arguments (excluding any user-passed --model overrides)
-    base_argv = [arg for arg in argv if not arg.startswith('--model=')]
-
-    # Try to load implementation once to check for main()
-    impl_mod = None
-    impl_main = None
+    # Try import-and-call main() if present
     try:
         impl_mod = _import_impl_module(impl_path)
         impl_main = getattr(impl_mod, "main", None)
+        if callable(impl_main):
+            try:
+                rc = impl_main(argv)
+                return int(rc) if rc is not None else 0
+            except TypeError:
+                rc = impl_main()
+                return int(rc) if rc is not None else 0
     except Exception:
         pass
 
-    for model in models_to_run:
-        print(f"\n{'='*60}\nStarting benchmark for: {model}\n{'='*60}")
-        
-        # Construct argv for this specific model
-        current_argv = base_argv + [f"--model={model}"]
-        
-        try:
-            if callable(impl_main):
-                try:
-                    impl_main(current_argv)
-                except TypeError:
-                    impl_main()
-            else:
-                # Fallback: run as script
-                old_sys_argv = sys.argv[:]
-                sys.argv = [str(impl_path)] + current_argv
-                runpy.run_path(str(impl_path), run_name="__main__")
-                sys.argv = old_sys_argv
-        except Exception as e:
-            print(f"Error running benchmark for {model}: {e}")
-            continue
+    # Fallback: run file as __main__
+    old_argv = sys.argv[:]
+    try:
+        sys.argv = [str(impl_path)] + argv
+        runpy.run_path(str(impl_path), run_name="__main__")
+        return 0
+    finally:
+        sys.argv = old_argv
 
-    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
