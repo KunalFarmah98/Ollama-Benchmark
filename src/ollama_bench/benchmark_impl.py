@@ -82,7 +82,7 @@ STOP AFTER ARCHITECTURE IS COMPLETE.
 """
 
 # Phase1: runnable scaffold + manifest, but must reflect Phase0 decisions.
-PHASE1_PROMPT_TEMPLATE = r"""
+PHASE1_PROMPT = r"""
 You are a senior Kotlin backend engineer.
 
 ARCHITECTURE CONTEXT (summary from Phase 0):
@@ -132,12 +132,20 @@ SCAFFOLD REQUIREMENTS (ONLY):
 IMPORTANT:
 - Do NOT generate full implementation yet.
 - Keep output small enough to not truncate.
+- If the context is filled, compact your content but do not stop mid-way. Specifically:
+  - Remove any unnecessary or redundant information.
+  - Ensure that the JSON object remains valid and complete.
+  - Continue generating until the entire scaffold is produced.
+- MANIFEST.md MUST be generated with a strictly formatted PENDING_FILES section:
+  - The section must start with "## PENDING_FILES"
+  - Each file path must be prefixed with "- "
+  - There must be at least 20 unique file paths in the PENDING_FILES section
+  - Do not include any other sections or deviations from this format
 
 Now output the JSON object.
 """
 
-# Phase2: generate specific files in batches, still aligned to architecture summary.
-PHASE2_PROMPT_TEMPLATE = r"""
+PHASE2_PROMPT = r"""
 You are implementing a production-grade Kotlin prototype for a distributed event-driven trading system.
 
 ARCHITECTURE CONTEXT (summary from Phase 0):
@@ -171,10 +179,9 @@ QUALITY RULES:
   - at least 3 unit tests in :core
   - a runnable load test script (k6 JS or Kotlin client)
 
-Stop ONLY after ALL files listed are produced.
+STOP ONLY after ALL files listed are produced.
 Now output the JSON object.
 """
-
 
 # ============================================================
 # Phase0: architecture generation + summary extraction
@@ -190,6 +197,16 @@ def _summarize_for_injection(full_arch_text: str, max_chars: int = 1800) -> str:
         return t
     return t[:max_chars].rstrip() + "\n\n[...truncated summary for prompt injection...]"
 
+def strip_leading_bos_token(prompt: str, bos_token: str) -> str:
+    """
+    Strips leading BOS token from the prompt if present.
+    
+    :param prompt: The original prompt string.
+    :param bos_token: The beginning-of-sequence (BOS) token to remove.
+    :return: The modified prompt with leading BOS token removed if present.
+    """
+    return prompt.lstrip(bos_token)
+
 
 def phase0_architecture(
     *,
@@ -203,7 +220,7 @@ def phase0_architecture(
 ) -> tuple[str, str]:
     """
     Runs Phase 0 and stores architecture to disk. Returns (full_text, summary_text).
-    Uses explicit num_ctx to prevent prompt truncation. [1](https://github.com/D4RK-777/Qwen3-LLM-Coder)[2](https://docs.continue.dev/guides/ollama-guide)
+    Uses explicit num_ctx to prevent prompt truncation.
     """
     resp = generate_with_autocontinue(
         model=model,
@@ -244,18 +261,18 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 RUNS_DIR.mkdir(exist_ok=True)
 PROJECTS_DIR.mkdir(exist_ok=True)
 
-DEFAULT_TIMEOUT_SEC = 1800
+DEFAULT_TIMEOUT_SEC = 60000
 DEFAULT_COOLDOWN_SEC = 15
 DEFAULT_TEMPERATURE = 0.2
 
 # IMPORTANT: large prompts require explicit num_ctx
-DEFAULT_NUM_CTX = 16384
-DEFAULT_NUM_PREDICT_PHASE1 = 2048
-DEFAULT_NUM_PREDICT_PHASE2 = 4096
+DEFAULT_NUM_CTX = 65536
+DEFAULT_NUM_PREDICT_PHASE1 = 65536
+DEFAULT_NUM_PREDICT_PHASE2 = 65536
 DEFAULT_PHASE2_BATCH = 8
 
 # Auto-continue settings
-DEFAULT_MAX_HOPS = 6
+DEFAULT_MAX_HOPS = 20
 DEFAULT_MIN_BATCH = 2
 
 
@@ -888,7 +905,7 @@ def generate_with_autocontinue(
 
         resp = api_generate(
             model=model,
-            prompt=hop_prompt,
+            prompt=strip_leading_bos_token(hop_prompt, bos_token=""),  # Replace "" with the actual BOS token used by your model
             temperature=temperature,
             timeout=timeout,
             num_ctx=num_ctx,
@@ -1073,18 +1090,24 @@ def phase1_scaffold(
 
     write_files_to_dir(project_dir, files)
 
-    # Save sanitized phase1 JSON for debugging
+        # Save sanitized phase1 JSON for debugging
     phase1_json_path = run_dir / "models" / safe_name(model) / f"phase1_{run_dir.name}.json"
     phase1_json_path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
     # Check if MANIFEST.md has PENDING_FILES section
     manifest_path = project_dir / "MANIFEST.md"
-    if not manifest_path.exists():
-        raise RuntimeError("Phase 1 missing MANIFEST.md.")
+    # Note: The manifest content must be extracted from the phase1 object or a specific file in the scaffold
+    # Since phase1_obj contains the 'files' list, we find the MANIFEST.md entry
+    manifest_entry = next((f for f in obj.get("files", []) if f.get("path") == "MANIFEST.md"), None)
+    if manifest_entry:
+        manifest_content = manifest_entry.get("content", "")
+        manifest_path.write_text(manifest_content, encoding="utf-8")
 
-    pending_files = parse_pending_files(manifest_path.read_text(encoding="utf-8"))
-    if len(pending_files) < 20:
-        raise RuntimeError(f"MANIFEST.md has no PENDING_FILES list or fewer than 20 files. Found {len(pending_files)} files.")
+        pending_files = parse_pending_files(manifest_content)
+        if len(pending_files) < 20:
+            raise RuntimeError(f"MANIFEST.md has no PENDING_FILES list or fewer than 20 files. Found {len(pending_files)} files.")
+    else:
+        raise RuntimeError("Phase 1 did not produce a MANIFEST.md file in the scaffold.")
 
     return obj, project_dir
 
@@ -1129,7 +1152,7 @@ def phase2_generate_files(
     while i < len(pending_files):
         current = pending_files[i:i + batch_size]
         file_list_str = "\n".join(current)
-        prompt = PHASE2_PROMPT_TEMPLATE.replace("{ARCH_SUMMARY}", arch_summary).replace("{FILE_LIST}", file_list_str)
+        prompt = PHASE2_PROMPT.replace("{ARCH_SUMMARY}", arch_summary).replace("{FILE_LIST}", file_list_str)
 
         # Generate chunk with autocontinue
         try:
@@ -1300,7 +1323,7 @@ def run_model_end_to_end(
 
 
         # --- Phase 1: Scaffold (JSON) ---
-        phase1_prompt = PHASE1_PROMPT_TEMPLATE.replace("{ARCH_SUMMARY}", arch_summary)
+        phase1_prompt = PHASE1_PROMPT.replace("{ARCH_SUMMARY}", arch_summary)
 
         phase1_resp = generate_with_autocontinue(
             model=model,
@@ -1476,6 +1499,7 @@ def write_run_artifacts(run_dir: Path, results: list[dict], env_info: dict):
 def parse_args(argv):
     p = argparse.ArgumentParser(description="2-phase Ollama benchmark that materializes runnable Kotlin projects.")
 
+    p.add_argument("--model", type=str, help="The specific model to benchmark")
     p.add_argument("--timeout", type=int, default=env_int("BENCH_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC))
     p.add_argument("--cooldown", type=int, default=env_int("BENCH_COOLDOWN_SEC", DEFAULT_COOLDOWN_SEC))
     p.add_argument("--temperature", type=float, default=env_float("BENCH_TEMPERATURE", DEFAULT_TEMPERATURE))
