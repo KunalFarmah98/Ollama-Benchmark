@@ -275,6 +275,13 @@ DEFAULT_PHASE2_BATCH = 8
 DEFAULT_MAX_HOPS = 20
 DEFAULT_MIN_BATCH = 2
 
+ALLOWED_MODELS = [
+    "deepseek-coder-v2:16b",
+    "gemma4:26b",
+    "qwen3-coder:latest",
+    "qwen2.5-coder:14b"
+]
+
 
 # ============================================================
 # Env helpers
@@ -1523,7 +1530,32 @@ def parse_args(argv):
 
 
 def main(argv=None):
-    args = parse_args(argv)
+    # 1. Handle argv initialization
+    if argv is None:
+        argv = sys.argv
+    else:
+        # Ensure argv[0] is a placeholder for the script name
+        argv = [sys.argv[0]] + argv
+
+    # 2. Use parse_known_args to ignore the extra path argument from runpy
+    import argparse
+    parser = argparse.ArgumentParser(description="Ollama Benchmark Worker")
+    parser.add_argument("--model", type=str)
+    parser.add_argument("--timeout", type=int, default=env_int("BENCH_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC))
+    parser.add_argument("--cooldown", type=int, default=int(env_str("BENCH_COOLDOWN_SEC", "15")))
+    parser.add_argument("--temperature", type=float, default=env_float("BENCH_TEMPERATURE", DEFAULT_TEMPERATURE))
+    parser.add_argument("--num-ctx", type=int, default=env_int("BENCH_NUM_CTX", DEFAULT_NUM_CTX))
+    parser.add_argument("--phase0-num-predict", type=int, default=env_int("BENCH_PHASE0_NUM_PREDICT", 4096))
+    parser.add_argument("--phase1-num_predict", type=int, default=env_int("BENCH_PHASE1_NUM_PREDICT", 4096))
+    parser.add_argument("--phase2-num-predict", type=int, default=env_int("BENCH_PHASE2_NUM_PREDICT", 4096))
+    parser.add_argument("--phase2-batch", type=int, default=env_int("BENCH_PHASE2_BATCH", 1))
+    parser.add_argument("--max-hops", type=int, default=env_int("BENCH_MAX_HOPS", 5))
+
+    # Using parse_known_args to prevent the "unrecognized arguments" error
+    args, unknown = parser.parse_known_args(argv)
+    
+    if unknown:
+        print(f"DEBUG: Ignoring unknown arguments from Orchestrator: {unknown}")
 
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -1531,10 +1563,22 @@ def main(argv=None):
     run_dir = RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    models = get_pulled_models()
-    if not models:
-        print("No local models found. Run `ollama list` to verify.")
-        return 1
+    # 3. Model selection logic
+    if args.model:
+        print(f"DEBUG: Target model provided via CLI: {args.model}")
+        models_to_run = [args.model]
+    else:
+        all_pulled = get_pulled_models()
+        print(f"DEBUG: Models found in Ollama: {all_pulled}")
+        models_to_run = []
+        for pulled in all_pulled:
+            if any(allowed in pulled for allowed in ALLOWED_MODELS):
+                models_to_run.append(pulled)
+        
+        if not models_to_run:
+            print(f"ERROR: No matching models found. Pulled: {all_pulled}, Allowed: {ALLOWED_MODELS}")
+            return 1
+        print(f"DEBUG: Models selected for benchmark: {models_to_run}")
 
     env_info = get_python_env_info()
     env_info["ollama_version"] = get_ollama_version()
@@ -1543,49 +1587,57 @@ def main(argv=None):
 
     results = []
     pbar = tqdm(
-        models,
+        models_to_run,
         desc="Benchmarking models",
         unit="model",
-        mininterval=0.5,   # avoid excessive redraws
+        mininterval=0.5,
     )
 
-    for model in pbar:
-        # ✅ reset per-model timer
+    print(f"DEBUG: Entering loop. Total models to process: {len(models_to_run)}")
+
+    for i, model in enumerate(pbar):
+        print(f"\n[ITERATION {i}] Starting processing for: {model}")
         model_start = time.monotonic()
-
-        # left side description (stable)
-        pbar.set_description("Benchmarking models", refresh=False)
-
-        # right side dynamic info
+        
+        pbar.set_description("Benchmaking models", refresh=False)
         pbar.set_postfix_str(f"{model}, model_time=00:00", refresh=True)
 
-        r = run_model_end_to_end(
-            model=model,
-            run_dir=run_dir,
-            temperature=args.temperature,
-            timeout=args.timeout,
-            num_ctx=args.num_ctx,
-            phase0_num_predict=args.phase0_num_predict,
-            phase1_num_predict=args.phase1_num_predict,
-            phase2_num_predict=args.phase2_num_predict,
-            max_hops=args.max_hops,
-            batch_size=args.phase2_batch,
-        )
-        results.append(r)
+        try:
+            print(f"DEBUG: Calling run_model_end_to_end for {model}...")
+            r = run_model_end_to_end(
+                model=model,
+                run_dir=run_dir,
+                temperature=args.temperature,
+                timeout=args.timeout,
+                num_ctx=args.num_ctx,
+                phase0_num_predict=args.phase0_num_predict,
+                phase1_num_predict=args.phase1_num_predict,
+                phase2_num_predict=args.phase2_num_predict,
+                max_hops=args.max_hops,
+                batch_size=args.phase2_batch,
+            )
+            print(f"DEBUG: run_model_end_to_end returned for {model}")
+            results.append(r)
+        except Exception as e:
+            print(f"CRITICAL ERROR during execution of {model}: {e}")
+            import traceback
+            traceback.print_exc()
+            results.append({"model": model, "error": str(e)})
 
-        # ✅ update final timer once model finishes
         elapsed = time.monotonic() - model_start
         pbar.set_postfix_str(
             f"{model} | {'ERROR' if r.get('error') else 'OK'}, "
+            f"model_name={model}, "
             f"model_time={_fmt_mmss(elapsed)}",
             refresh=True,
         )
 
+        print(f"DEBUG: Finished iteration {i}. Sleeping for cooldown...")
         time.sleep(args.cooldown)
 
+    print(f"DEBUG: Loop finished. Writing artifacts for {len(results)} results.")
     write_run_artifacts(run_dir, results, env_info)
     print(f"\n✅ Run saved to: {run_dir}")
-    print(f"✅ Projects saved under: {PROJECTS_DIR}")
     return 0
 
 
