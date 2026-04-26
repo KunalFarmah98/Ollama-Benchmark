@@ -1,0 +1,6 @@
+
+requests
+numpy
+psutil
+tqdm
+python-dotenv

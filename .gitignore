@@ -1,0 +1,15 @@
+
+# venv
+.venv/
+venv/
+
+# env vars
+.env
+
+# outputs
+ollama_benchmarks/
+*.log
+
+# python cache
+__pycache__/
+*.pyc

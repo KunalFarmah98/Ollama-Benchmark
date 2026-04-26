@@ -1,0 +1,10 @@
+README.md
+pyproject.toml
+src/ollama_bench/__init__.py
+src/ollama_bench/__main__.py
+src/ollama_bench/benchmark.py
+src/ollama_bench/benchmark__impl.py
+src/ollama_bench.egg-info/PKG-INFO
+src/ollama_bench.egg-info/SOURCES.txt
+src/ollama_bench.egg-info/dependency_links.txt
+src/ollama_bench.egg-info/top_level.txt
