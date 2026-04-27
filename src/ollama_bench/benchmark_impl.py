@@ -266,13 +266,13 @@ DEFAULT_COOLDOWN_SEC = 15
 DEFAULT_TEMPERATURE = 0.2
 
 # IMPORTANT: large prompts require explicit num_ctx
-DEFAULT_NUM_CTX = 65536
-DEFAULT_NUM_PREDICT_PHASE1 = 65536
-DEFAULT_NUM_PREDICT_PHASE2 = 65536
+DEFAULT_NUM_CTX = 8192
+DEFAULT_NUM_PREDICT_PHASE1 = 16384
+DEFAULT_NUM_PREDICT_PHASE2 = 16384
 DEFAULT_PHASE2_BATCH = 8
 
 # Auto-continue settings
-DEFAULT_MAX_HOPS = 20
+DEFAULT_MAX_HOPS = 6
 DEFAULT_MIN_BATCH = 2
 
 ALLOWED_MODELS = [
@@ -1254,8 +1254,6 @@ def unload_model(model: str):
         return {"method": "api keep_alive=0", "ok": False, "detail": str(e)}
 
 
-
-
 def run_model_end_to_end(
     *,
     model: str,
@@ -1269,8 +1267,8 @@ def run_model_end_to_end(
     max_hops: int,
     batch_size: int,
 ) -> dict:
+    print(f"DEBUG: [FUNC_START] Entering run_model_end_to_end for {model}")
     sampler = PeakSampler(interval=0.5)
-
     result: dict[str, Any] = {
         "model": model,
         "run_id": run_dir.name,
@@ -1282,36 +1280,35 @@ def run_model_end_to_end(
         "phase2_num_predict": phase2_num_predict,
         "phase2_batch": batch_size,
         "max_hops": max_hops,
-
         "project_dir": None,
         "phase2_stats": None,
-
         "gradle_test": None,
         "app_smoke": None,
-
         "memory_baseline": None,
         "memory_after": None,
         "peak_rss_mb": None,
         "peak_vram_mb": None,
-
         "wall_time_sec": None,
         "error": None,
         "unload": None,
     }
-
     t0 = time.time()
     model_log_dir = run_dir / "models" / safe_name(model) / "validation_logs"
     model_log_dir.mkdir(parents=True, exist_ok=True)
 
     try:
+        print(f"DEBUG: [FUNC_STEP] Initializing memory sampler and preloading model: {model}")
         result["memory_baseline"] = snapshot_memory()
         sampler.start()
+
+        # Log all context parameters before calling preload_model
+        print(f"DEBUG: [CONTEXT_PARAMS] temperature={temperature}, timeout={timeout}, num_ctx={num_ctx}")
 
         # Load model once (ensure context is set)
         preload_model(model, temperature=temperature, timeout=timeout, num_ctx=num_ctx)
 
         # --- Phase 0: Architecture (TEXT) ---
-    
+        print(f"DEBUG: [FUNC_STEP] Starting Phase 0 (Architecture) for {model}")
         try:
             full_arch, arch_summary = phase0_architecture(
                 model=model,
@@ -1323,15 +1320,15 @@ def run_model_end_to_end(
                 max_hops=max_hops,
             )
             result["phase0_response"] = full_arch  # Save raw response
+            print(f"DEBUG: [FUNC_STEP] Phase 0 complete for {model}")
         except Exception as e:
             _write_phase_error(run_dir, model, "PHASE0", e)
             result["error"] = f"Phase 0 (architecture) failed: {e}"
             raise
 
-
         # --- Phase 1: Scaffold (JSON) ---
+        print(f"DEBUG: [FUNC_STEP] Starting Phase 1 (Scaffolding) for {model}")
         phase1_prompt = PHASE1_PROMPT.replace("{ARCH_SUMMARY}", arch_summary)
-
         phase1_resp = generate_with_autocontinue(
             model=model,
             prompt=phase1_prompt,
@@ -1342,11 +1339,10 @@ def run_model_end_to_end(
             force_json=False,
             max_hops=max_hops,
         )
-
         phase1_text = (phase1_resp.get("response") or "").strip()
         result["phase1_response"] = phase1_text  # Save raw response
-
         phase1_obj = extract_json_object(phase1_text)
+
         if not phase1_obj or "files" not in phase1_obj or "project" not in phase1_obj:
             raise RuntimeError("Phase 1 did not produce valid JSON with project/files.")
 
@@ -1354,15 +1350,17 @@ def run_model_end_to_end(
         project_dir = PROJECTS_DIR / safe_name(model) / f"{proj_name}_{run_dir.name}"
         project_dir.mkdir(parents=True, exist_ok=True)
         result["project_dir"] = str(project_dir)
+        write_files_to_dir(project_dir, phase1_obj["files"])
 
-        wrote1 = write_files_to_dir(project_dir, phase1_obj["files"])
         # Save phase1 raw/json for debugging
         model_dir = run_dir / "models" / safe_name(model)
         model_dir.mkdir(parents=True, exist_ok=True)
         (model_dir / f"phase1_raw_{run_dir.name}.txt").write_text(phase1_text, encoding="utf-8")
         (model_dir / f"phase1_{run_dir.name}.json").write_text(json.dumps(phase1_obj, indent=2), encoding="utf-8")
+        print(f"DEBUG: [FUNC_STEP] Phase 1 complete. Project directory: {project_dir}")
 
         # --- Phase 2: Implementation (JSON batches) ---
+        print(f"DEBUG: [FUNC_STEP] Starting Phase 2 (Implementation/Batching) for {model}")
         manifest_path = project_dir / "MANIFEST.md"
         if not manifest_path.exists():
             raise RuntimeError("Phase 1 missing MANIFEST.md.")
@@ -1385,16 +1383,17 @@ def run_model_end_to_end(
                 arch_summary=arch_summary,
             )
             result["phase2_stats"] = phase2_stats
+            print(f"DEBUG: [FUNC_STEP] Phase 2 complete for {model}")
         except Exception as e:
             _write_phase_error(run_dir, model, "PHASE2", e)
             result["error"] = f"Phase 2 (implementation) failed: {e}"
             raise
 
         # --- Validation: Gradle tests + app smoke ---
+        print(f"DEBUG: [FUNC_STEP] Starting Validation (Gradle/Smoke) for {model}")
         try:
             tests_result = run_gradle_tests(project_dir)
             app_result = run_app_smoke(project_dir)
-
             (model_log_dir / "gradle_test_stdout.txt").write_text(tests_result.get("stdout", ""), encoding="utf-8")
             (model_log_dir / "gradle_test_stderr.txt").write_text(tests_result.get("stderr", ""), encoding="utf-8")
             (model_log_dir / "app_run_stdout.txt").write_text(app_result.get("stdout", ""), encoding="utf-8")
@@ -1413,16 +1412,19 @@ def run_model_end_to_end(
                 raise RuntimeError("Gradle tests failed (./gradlew test).")
             if not app_result.get("ok"):
                 raise RuntimeError("App smoke validation failed (health/metrics/ingest).")
+            print(f"DEBUG: [FUNC_STEP] Validation complete for {model}")
         except Exception as e:
             _write_phase_error(run_dir, model, "VALIDATION", e)
             result["error"] = f"Validation failed: {e}"
             raise
 
+        print(f"DEBUG: [FUNC_END] Successfully finished all phases for {model}")
+
     except Exception as e:
         logging.exception("Exception in run_model_end_to_end for model %s", model)
         result["error"] = str(e)
-
     finally:
+        print(f"DEBUG: [FINALLY] Cleaning up resources for {model}")
         try:
             sampler.stop()
         except Exception:
@@ -1432,10 +1434,8 @@ def run_model_end_to_end(
         result["memory_after"] = snapshot_memory()
         result["wall_time_sec"] = round(time.time() - t0, 3)
         result["unload"] = unload_model(model)
-
-    return result
-
-
+        print(f"DEBUG: [FUNC_EXIT] Exiting run_model_end_to_end for {model}")
+        return result
 
 # ============================================================
 # Run artifacts (timestamp in filenames)
