@@ -1,0 +1,16 @@
+node_modules/
+dist/
+build/
+.git/
+*.lock
+*.min.js
+*.min.css
+*.map
+coverage/
+.next/
+__pycache__/
+*.pyc
+.env
+*.log
+.venv/
+venv/
