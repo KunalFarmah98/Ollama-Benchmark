@@ -1,5 +1,14 @@
 ## Project: Ollama-bench
 
+# STARTUP SEQUENCE — RUN IMMEDIATELY ON SESSION START
+
+1. Call `rag_rag_health` to confirm the RAG index is live
+2. Call `Bash("dir /s /b")` to map the project file structure
+3. Output exactly: "✅ Ready. [X] RAG chunks indexed. Awaiting task."
+4. Do NOT greet the user
+5. Do NOT ask what to do
+6. Wait silently for the first instruction
+
 ## Directory Structure
 Run `tree /F /A` to get the full file list if needed.
 
