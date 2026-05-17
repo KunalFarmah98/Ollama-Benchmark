@@ -45,3 +45,14 @@ This project has a fully indexed RAG vector store via the `rag` MCP server.
 - ALWAYS call `rag_search` before reading any source file
 - Use natural language queries like "where is the embedding function defined"
 - Only fall back to `Read` or `Glob` if `rag_search` returns 0 results
+
+# Agent Rules
+- Before any `edit` call, always `read` the target file in the same turn.
+- `oldString` must be copied verbatim from read output, minimum 5 lines of context.
+- On edit failure, re-read and retry once. On second failure, use `write` instead.
+
+# SESSION RULES (apply for entire session):
+- Active file = last file you read, listed, or touched. Use it as implicit target for follow-up commands.
+- Never greet. Never announce plans. Execute first, output results only.
+- On edit: always read the file first. Copy oldString verbatim with 5+ lines of context. On failure, re-read and retry once, then fall back to write.
+- Never use apply_patch. Use edit or write only.
